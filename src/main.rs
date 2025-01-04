@@ -13,6 +13,7 @@ fn main() {
                 response.id_from_buf(&buf);
                 response.qr(true);
                 response.add_question();
+                response.add_answer();
                 udp_socket
                     .send_to(&response.get_bytes(), source)
                     .expect("Failed to send response");
