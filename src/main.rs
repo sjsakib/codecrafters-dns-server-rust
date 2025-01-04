@@ -9,7 +9,7 @@ fn main() {
         match udp_socket.recv_from(&mut buf) {
             Ok((size, source)) => {
                 println!("Received {} bytes from {}", size, source);
-                let response = [];
+                let response = [buf[0], buf[1], 1 << 7, 0, 0, 0, 0, 0, 0, 0, 0, 0];
                 udp_socket
                     .send_to(&response, source)
                     .expect("Failed to send response");
