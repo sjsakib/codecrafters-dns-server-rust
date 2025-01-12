@@ -1,12 +1,38 @@
-use std::net::Ipv4Addr;
 use bytes::{BufMut, BytesMut};
+use std::net::Ipv4Addr;
 
 fn split_u16(n: u16) -> (u8, u8) {
     ((n >> 8) as u8, (n & 0xFF) as u8)
 }
 
+fn parse_label(buf: &[u8], offset: usize) -> (String, usize, bool) {
+    let label_len = buf[offset] as usize;
+
+    println!("Label len: {}", label_len);
+
+    if label_len == 0 {
+        (String::from(""), offset + 1, false)
+    } else if label_len > 63 {
+        // 00000011000000
+        // 11111100111111
+        let mut off = ((((label_len as u16) & 0b1111111100111111u16) << 8) as usize)
+            + (buf[offset + 1] as usize)
+            - 12usize;
+
+        println!("Codded offset: {}, bytes: {:?}", off, buf);
+
+        let (label, end, __) = parse_label(buf, off);
+
+        (label, end, true)
+    } else {
+        let label = String::from_utf8(buf[offset + 1..offset + label_len + 1].to_vec()).unwrap();
+
+        (label, offset + label_len + 1, false)
+    }
+}
+
 pub struct Message {
-    head: [u8; 12],
+    pub head: [u8; 12],
     questions: Vec<Question>,
     answers: Vec<Answer>,
 }
@@ -35,7 +61,8 @@ impl Question {
     }
 }
 
-struct Answer {
+#[derive(Clone, Debug)]
+pub struct Answer {
     question: Question,
     ttl: u32,
     data: u32,
@@ -53,10 +80,57 @@ impl Answer {
     }
 }
 
+trait Buf {
+    fn get_u16(self, offset: usize) -> u16;
+    fn get_u4(self, offset: usize) -> u8;
+    fn get_u32(self, offset: usize) -> u32;
+}
+
+impl Buf for &[u8] {
+    fn get_u16(self, offset: usize) -> u16 {
+        let byte_offset = offset / 8;
+        let mut x = 0u16;
+        x |= self[byte_offset + 1] as u16;
+        x |= (self[byte_offset] as u16) << 8;
+
+        x
+    }
+
+    fn get_u4(self, offset: usize) -> u8 {
+        let byte_idx = offset / 8;
+        let bit_offset = offset % 8;
+
+        (self[byte_idx] & (0b00001111 << (4 - bit_offset))) >> (4 - bit_offset)
+    }
+
+    fn get_u32(self, offset: usize) -> u32 {
+        let byte_offset = offset / 8;
+        let mut x = 0u32;
+        x |= self[byte_offset + 3] as u32;
+        x |= (self[byte_offset + 2] as u32) << 8;
+        x |= (self[byte_offset + 1] as u32) << 16;
+        x |= (self[byte_offset] as u32) << 24;
+
+        x
+    }
+}
+
 impl Message {
     pub fn new() -> Message {
         Message {
             head: [0; 12],
+            questions: vec![],
+            answers: vec![],
+        }
+    }
+
+    pub fn from_header_buf(buf: &[u8]) -> Message {
+        let mut head = [0u8; 12];
+
+        head.copy_from_slice(buf);
+
+        Message {
+            head,
             questions: vec![],
             answers: vec![],
         }
@@ -73,9 +147,14 @@ impl Message {
             answers: vec![],
         };
 
-        message.parse_questions(&buf[12..]);
+        let i = message.parse_section(&buf[12..], true);
 
         println!("Questions: {:?}", message.questions);
+
+        // println!("Parsing answers from offset: {}", i);
+        message.parse_section(&buf[12 + i..], false);
+
+        println!("Answers: {:?}", message.answers);
 
         message
     }
@@ -101,20 +180,16 @@ impl Message {
     }
 
     fn get_u4(&self, offset: usize) -> u8 {
-        let byte_idx = offset / 8;
-        let bit_offset = offset % 8;
-
-        (self.head[byte_idx] & (0b00001111 << (4 - bit_offset))) >> (4 - bit_offset)
+        self.head.get_u4(offset)
     }
 
     /// Assumes no fractional byte is needed
     fn get_u16(&self, offset: usize) -> u16 {
-        let byte_offset = offset / 8;
-        let mut x = 0u16;
-        x |= self.head[byte_offset + 1] as u16;
-        x |= (self.head[byte_offset] as u16) << 8;
+        self.head.get_u16(offset)
+    }
 
-        x
+    fn get_u32(&self, offset: usize) -> u32 {
+        self.head.get_u32(offset)
     }
 
     pub fn get_bytes(&mut self) -> Vec<u8> {
@@ -152,11 +227,11 @@ impl Message {
         self.get_u4(28)
     }
 
-    // fn set_qd_count(&mut self, count: u16) {
-    //     let (high, low) = split_u16(count);
-    //     self.head[4] = high;
-    //     self.head[5] = low;
-    // }
+    fn set_qd_count(&mut self, count: u16) {
+        let (high, low) = split_u16(count);
+        self.head[4] = high;
+        self.head[5] = low;
+    }
 
     fn get_qd_count(&self) -> u16 {
         self.get_u16(32)
@@ -169,34 +244,81 @@ impl Message {
     }
 
     pub fn get_a_count(&self) -> u16 {
-        self.get_u16(32)
+        self.get_u16(48)
     }
 
-    pub fn parse_questions(&mut self, buf: &[u8]) {
-        let q_count = self.get_qd_count();
+    pub fn parse_section(&mut self, buf: &[u8], is_question: bool) -> usize {
+        // println!("bytes: {:?}", buf);
+        let total_count = if is_question {
+            self.get_qd_count()
+        } else {
+            self.get_a_count()
+        };
+
+        // println!("Total count: {}", total_count);
+
+        let mut count = 0;
 
         let mut i = 0;
-        while i < buf.len() && (self.questions.len() as u16) < q_count {
+        // while i < buf.len() && (self.questions.len() as u16) < count {
+        while i < buf.len() && count < total_count {
             let mut labels: Vec<String> = vec![];
-            let mut label_len = buf[i] as usize;
+            loop {
+                let (label, end, was_compressed) = parse_label(buf, i);
 
-            while label_len > 0 {
-                i += 1;
-                let label = String::from_utf8(buf[i..i + label_len].to_vec()).unwrap();
+                if was_compressed {
+                    labels.push(label);
+                    let mut ii = end;
+                    loop {
+                        let (l, e, _) = parse_label(buf, ii);
+
+                        if e == ii + 1 {
+                            break;
+                        }
+                        labels.push(l);
+                        ii = e;
+
+                    }
+                    i += 1;
+                    break;
+
+                }
+
+                if end == i + 1  {
+                    // if was_compressed {
+                    //     labels.push(label);
+                    //     i = end - 1;
+                    // }
+                    break;
+                }
                 labels.push(label);
-
-                i += label_len;
-                label_len = buf[i] as usize;
+                i = end;
             }
             i += 1;
-            self.questions.push(Question {
-                labels,
-                typ: ((buf[i] as u16) << 8) + buf[i + 1] as u16,
-                class: ((buf[i + 2] as u16) << 8) + buf[i + 3] as u16,
-            });
 
+            println!("Labels: {:?} {}", labels, i);
+
+            let question = Question {
+                labels,
+                typ: buf.get_u16(i * 8),
+                class: buf.get_u16((i + 2) * 8),
+            };
             i += 4;
+            if is_question {
+                self.questions.push(question);
+            } else {
+                self.answers.push(Answer {
+                    question,
+                    ttl: buf.get_u32(i * 8),
+                    data: buf.get_u32((i + 6) * 8),
+                });
+
+                i += 10;
+            }
+            count += 1;
         }
+
+        i
     }
     pub fn add_answer(&mut self, question: Question, ttl: u32, data: Ipv4Addr) {
         let answer = Answer {
@@ -209,7 +331,21 @@ impl Message {
         self.set_a_count(self.answers.len() as u16);
     }
 
+    pub fn push_answer(&mut self, answer: Answer) {
+        self.answers.push(answer);
+        self.set_a_count(self.answers.len() as u16);
+    }
+
+    pub fn push_question(&mut self, question: &Question) {
+        self.questions.push(question.clone());
+        self.set_qd_count(self.questions.len() as u16);
+    }
+
     pub fn get_questions(&self) -> Vec<Question> {
         self.questions.clone()
+    }
+
+    pub fn get_answers(&self) -> Vec<Answer> {
+        self.answers.clone()
     }
 }
