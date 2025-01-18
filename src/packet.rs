@@ -21,8 +21,6 @@ impl<'b> Parser<'b> {
         self.packet.copy_head_from_slice(&self.buf[0..12]);
         self.cur = 12;
 
-        self.packet.print_header();
-
         self.parse_questions();
         self.parse_answers();
     }
@@ -38,7 +36,7 @@ impl<'b> Parser<'b> {
             let question = self.parse_question();
 
             let ttl = self.get_u32();
-            let _ = self.get_u8();
+            let _ = self.get_u16();
             let data = self.get_u32();
 
             self.packet.push_answer(Answer {
@@ -171,9 +169,9 @@ impl Question {
 
 #[derive(Clone, Debug)]
 pub struct Answer {
-    question: Question,
-    ttl: u32,
-    data: u32,
+    pub question: Question,
+    pub ttl: u32,
+    pub data: u32,
 }
 
 impl Answer {
@@ -244,7 +242,7 @@ impl DnsPacket {
         }
     }
 
-    fn get_id(&self) -> u16 {
+    pub fn get_id(&self) -> u16 {
         self.head.get_u16(0)
     }
 
@@ -260,8 +258,8 @@ impl DnsPacket {
         self.head.get_bit(18)
     }
 
-    fn get_rd(&self) -> u8 {
-        self.head.get_bit(24)
+    pub fn get_rd(&self) -> u8 {
+        self.head.get_bit(23)
     }
 
     fn get_ra(&self) -> u8 {
@@ -274,6 +272,10 @@ impl DnsPacket {
 
     pub fn get_opcode(&self) -> u8 {
         self.head.get_u4(17)
+    }
+
+    pub fn set_opcode(&mut self, opcode: u8) {
+        self.head.put_u4(17, opcode);
     }
 
     pub fn get_rcode(&self) -> u8 {
@@ -296,8 +298,8 @@ impl DnsPacket {
         self.head.get_u16(80)
     }
 
-    fn set_id(&mut self, id: u32) {
-        self.head.put_u16(0, id as u16);
+    pub fn set_id(&mut self, id: u16) {
+        self.head.put_u16(0, id);
     }
 
     pub fn set_qr(&mut self, f: u8) {
@@ -309,7 +311,7 @@ impl DnsPacket {
     }
 
     pub fn set_rd(&mut self, f: u8) {
-        self.head.put_bit(24, f)
+        self.head.put_bit(23, f)
     }
 
     pub fn set_rcode(&mut self, rcode: u8) {

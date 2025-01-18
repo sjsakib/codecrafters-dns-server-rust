@@ -56,7 +56,7 @@ impl BufferSetters for &mut [u8] {
         let bit_offset = offset % 8;
 
         self[byte_idx] =
-            self[byte_idx] & !(0x00FF << (4 - bit_offset)) | (value << (4 - bit_offset));
+            self[byte_idx] & !(0x0F << (4 - bit_offset)) | (value << (4 - bit_offset));
     }
 
     fn put_u16(self, offset: usize, value: u16) {
