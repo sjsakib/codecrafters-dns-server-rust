@@ -1,5 +1,5 @@
-use codecrafters_dns_server::{DnsServer, ServerConfig};
 use clap::Parser;
+use codecrafters_dns_server::{DnsServer, ServerConfig};
 
 /// A toy DNS server
 #[derive(Parser, Debug)]
@@ -17,7 +17,7 @@ struct Args {
 fn main() {
     let args = Args::parse();
 
-    let server = DnsServer::init(ServerConfig {
+    let server = DnsServer::new(ServerConfig {
         port: args.port,
         resolver: args.resolver,
     });

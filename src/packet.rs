@@ -1,11 +1,22 @@
 use crate::buffer_helpers::{BufferGetters, BufferSetters};
 use bytes::BufMut;
-use std::{net::Ipv4Addr, vec};
+use core::fmt;
+use std::{fmt::Display, vec};
 
-pub struct Parser<'b> {
-    buf: &'b [u8],
+pub struct Parser<'a> {
+    buf: &'a [u8],
     cur: usize,
     packet: DnsPacket,
+}
+
+#[derive(Debug)]
+pub enum ResponseCodes {
+    NoError = 0,
+    FormatError = 1,
+    ServerFailure = 2,
+    NameError = 3,
+    NotImplemented = 4,
+    Refused = 5,
 }
 
 impl<'b> Parser<'b> {
@@ -23,6 +34,7 @@ impl<'b> Parser<'b> {
 
         self.parse_questions();
         self.parse_answers();
+        self.parse_authorities();
     }
 
     pub fn get(self) -> DnsPacket {
@@ -33,17 +45,22 @@ impl<'b> Parser<'b> {
         let count = self.packet.get_an_count();
 
         for _ in 0..count {
-            let question = self.parse_question();
+            let ans = self.parse_record();
+            self.packet.push_answer(ans);
+        }
+    }
 
-            let ttl = self.get_u32();
-            let _ = self.get_u16();
-            let data = self.get_u32();
+    fn parse_record(&mut self) -> Answer {
+        let question = self.parse_question();
 
-            self.packet.push_answer(Answer {
-                question,
-                ttl,
-                data,
-            });
+        let ttl = self.get_u32();
+        let data_len = self.get_u16();
+        let data = self.get_slice(data_len as usize).to_vec();
+
+        Answer {
+            question,
+            ttl,
+            data,
         }
     }
 
@@ -56,11 +73,20 @@ impl<'b> Parser<'b> {
         }
     }
 
+    fn parse_authorities(&mut self) {
+        let count = self.packet.get_ns_count();
+
+        for _ in 0..count {
+            let question = self.parse_record();
+            self.packet.push_authority(question);
+        }
+    }
+
     fn parse_question(&mut self) -> Question {
         Question {
             labels: self.parse_labels(),
-            class: self.get_u16(),
             typ: self.get_u16(),
+            class: self.get_u16(),
         }
     }
 
@@ -73,7 +99,9 @@ impl<'b> Parser<'b> {
             labels.push(label);
 
             if let Some(end_position) = maybe_end_position {
-                maybe_labels_end_position = Some(end_position);
+                if maybe_labels_end_position == None {
+                    maybe_labels_end_position = Some(end_position);
+                }
             }
         }
 
@@ -92,14 +120,13 @@ impl<'b> Parser<'b> {
         }
 
         if len > 63 {
-            let pointer = ((len & 0b00111111) as u16 + self.get_u8() as u16) as usize;
+            let pointer = ((((len & 0b00111111) as u16) << 8) + self.get_u8() as u16) as usize;
 
             let cur = self.cur;
 
             self.cur = pointer;
             let len = self.get_u8() as usize;
             let label = self.parse_string(len);
-
             return Some((label, Some(cur)));
         }
         let label = self.parse_string(len as usize);
@@ -108,11 +135,18 @@ impl<'b> Parser<'b> {
     }
 
     fn parse_string(&mut self, len: usize) -> String {
-        let str = String::from_utf8(self.buf[self.cur..self.cur + len].to_vec()).unwrap();
+        let str = String::from_utf8(self.buf[self.cur..self.cur + len].to_vec());
 
         self.cur += len;
 
-        str
+        match str {
+            Ok(str) => return str,
+            Err(e) => {
+                println!("Failed to parse string: {}", e);
+
+                return String::from("");
+            }
+        }
     }
 
     fn get_u8(&mut self) -> u8 {
@@ -132,6 +166,19 @@ impl<'b> Parser<'b> {
         self.buf.get_u32((self.cur - 4) * 8)
     }
 
+    fn get_slice(&mut self, len: usize) -> &[u8] {
+        if len > self.buf.len() {
+            println!("Len: {}\n {:?}", len, self.buf);
+            // self.cur += len;
+            // return b"";
+        }
+        let slice = &self.buf[self.cur..self.cur + len];
+
+        self.cur += len;
+
+        slice
+    }
+
     fn forward(&mut self) {
         self.cur += 1;
     }
@@ -141,13 +188,14 @@ pub struct DnsPacket {
     pub head: [u8; 12],
     questions: Vec<Question>,
     answers: Vec<Answer>,
+    authorities: Vec<Answer>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Question {
     labels: Vec<String>,
-    class: u16,
     typ: u16,
+    class: u16,
 }
 impl Question {
     pub fn encode(&mut self) -> Vec<u8> {
@@ -167,11 +215,23 @@ impl Question {
     }
 }
 
+impl Display for Question {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} type: {}, class: {}",
+            self.labels.join("."),
+            self.typ,
+            self.class
+        )
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Answer {
     pub question: Question,
     pub ttl: u32,
-    pub data: u32,
+    pub data: Vec<u8>,
 }
 
 impl Answer {
@@ -179,10 +239,22 @@ impl Answer {
         let mut encoded = self.question.encode();
 
         encoded.put_u32(self.ttl);
-        encoded.put_u16(4);
-        encoded.put_u32(self.data);
+        encoded.put_u16(self.data.len() as u16);
+        encoded.put_slice(&self.data);
 
         encoded
+    }
+}
+
+impl Display for Answer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} ttl: {}, data length: {}",
+            self.question,
+            self.ttl,
+            self.data.len()
+        )
     }
 }
 
@@ -192,6 +264,7 @@ impl DnsPacket {
             head: [0; 12],
             questions: vec![],
             answers: vec![],
+            authorities: vec![],
         }
     }
 
@@ -230,11 +303,28 @@ impl DnsPacket {
         println!("AR_COUNT: {}", self.get_ar_count());
     }
 
+    pub fn print_summary(&self) {
+        println!(
+            "ID: {}, QD: {}, AN: {}, RCODE: {}",
+            self.get_id(),
+            self.get_qd_count(),
+            self.get_an_count(),
+            self.get_rcode()
+        );
+        for question in &self.questions {
+            println!("{}", question);
+        }
+        for answer in &self.answers {
+            println!("{}", answer);
+        }
+        print!("\n");
+    }
+
     pub fn print(&self) {
         self.print_header();
 
         for q in &self.questions {
-            println!("Questions: {:?}", q);
+            println!("Questions: {}", q);
         }
 
         for a in &self.answers {
@@ -290,7 +380,7 @@ impl DnsPacket {
         self.head.get_u16(48)
     }
 
-    fn get_ns_count(&self) -> u16 {
+    pub fn get_ns_count(&self) -> u16 {
         self.head.get_u16(64)
     }
 
@@ -314,8 +404,8 @@ impl DnsPacket {
         self.head.put_bit(23, f)
     }
 
-    pub fn set_rcode(&mut self, rcode: u8) {
-        self.head.put_u4(28, rcode);
+    pub fn set_rcode(&mut self, rcode: ResponseCodes) {
+        self.head.put_u4(28, rcode as u8);
     }
 
     fn set_qd_count(&mut self, count: u16) {
@@ -326,11 +416,11 @@ impl DnsPacket {
         self.head.put_u16(48, count);
     }
 
-    pub fn add_answer(&mut self, question: Question, ttl: u32, data: Ipv4Addr) {
+    pub fn add_answer(&mut self, question: Question, ttl: u32, data: &[u8]) {
         let answer = Answer {
             question,
             ttl,
-            data: data.to_bits(),
+            data: data.to_vec(),
         };
 
         self.answers.push(answer);
@@ -347,6 +437,15 @@ impl DnsPacket {
         self.set_qd_count(self.questions.len() as u16);
     }
 
+    pub fn push_authority(&mut self, authority: Answer) {
+        self.authorities.push(authority);
+        self.set_ar_count(self.authorities.len() as u16);
+    }
+
+    pub fn get_authorities(&self) -> Vec<Answer> {
+        self.authorities.clone()
+    }
+
     pub fn get_questions(&self) -> Vec<Question> {
         self.questions.clone()
     }
@@ -355,7 +454,7 @@ impl DnsPacket {
         self.answers.clone()
     }
 
-    pub fn get_bytes(&mut self) -> Vec<u8> {
+    pub fn encode(&mut self) -> Vec<u8> {
         let mut res = vec![];
         res.append(&mut self.head.to_vec());
 
@@ -364,6 +463,10 @@ impl DnsPacket {
         }
 
         for q in &mut self.answers {
+            res.append(&mut q.encode().to_vec());
+        }
+
+        for q in &mut self.authorities {
             res.append(&mut q.encode().to_vec());
         }
 

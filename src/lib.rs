@@ -1,5 +1,5 @@
-use packet::{Answer, DnsPacket, Question};
-use std::net::{Ipv4Addr, UdpSocket};
+use packet::{Answer, DnsPacket, Question, ResponseCodes};
+use std::{fmt::Display, net::UdpSocket, time::Duration};
 
 mod buffer_helpers;
 pub mod packet;
@@ -10,41 +10,58 @@ pub struct ServerConfig {
 }
 
 pub struct DnsServer {
-    udp_socket: UdpSocket,
-    resolver_address: Option<String>,
+    config: ServerConfig,
+}
+
+#[derive(Debug)]
+enum ServerError {
+    Resolver(String),
+    IO(String),
+    // Unknown(String),
+}
+
+impl std::error::Error for ServerError {}
+
+impl From<std::io::Error> for ServerError {
+    fn from(other: std::io::Error) -> Self {
+        ServerError::IO(format!("{}", other))
+    }
+}
+
+impl Display for ServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let msg = match self {
+            // ServerError::Unknown(msg) => msg,
+            ServerError::IO(msg) => msg,
+            ServerError::Resolver(msg) => msg,
+        };
+        write!(f, "{}", msg)
+    }
 }
 
 impl DnsServer {
-    pub fn init(config: ServerConfig) -> DnsServer {
-        println!("Starting server on port {}", config.port);
-        let udp_socket = UdpSocket::bind(format!("127.0.0.1:{}", config.port)).expect("Failed to bind to address");
-
-        DnsServer {
-            udp_socket,
-            resolver_address: config.resolver,
-        }
+    pub fn new(config: ServerConfig) -> DnsServer {
+        DnsServer { config }
     }
 
     pub fn listen(&self) {
-        println!("Listening for requests");
+        println!("Listening on port {}\n", self.config.port);
+
+        let udp_socket = UdpSocket::bind(format!("127.0.0.1:{}", self.config.port))
+            .expect("Failed to bind to address");
+
         loop {
             let mut buf = [0; 512];
-            match self.udp_socket.recv_from(&mut buf) {
+            match udp_socket.recv_from(&mut buf) {
                 Ok((size, source)) => {
                     println!("Received {} bytes from {}", size, source);
                     let mut request = DnsPacket::from_buf(&buf);
-
-                    println!("Received packet: ");
-                    request.print();
+                    request.print_summary();
 
                     let mut response = self.get_response(&mut request);
 
-                    println!("Sending response:");
-                    response.print();
-                    println!("\n");
-
-                    self.udp_socket
-                        .send_to(&response.get_bytes(), source)
+                    udp_socket
+                        .send_to(&response.encode(), source)
                         .expect("Failed to send response");
                 }
                 Err(e) => {
@@ -60,18 +77,18 @@ impl DnsServer {
         response.set_id(request.get_id());
         response.set_qr(1);
         response.set_rd(request.get_rd());
-        response.set_opcode(request.get_opcode());
 
         let opcode = request.get_opcode();
+        response.set_opcode(opcode);
 
         if opcode != 0 {
-            response.set_rcode(4);
+            response.set_rcode(ResponseCodes::NotImplemented);
 
             return response;
         }
 
         for question in request.get_questions() {
-            let answers = self.get_answers(question.clone());
+            let answers = self.get_answers(question.clone(), &mut response);
 
             match answers {
                 Ok(answers) => {
@@ -81,9 +98,9 @@ impl DnsServer {
                     }
                 }
                 Err(e) => {
-                    eprintln!("Failed to get answers: {}", e);
+                    eprintln!("Failed to get answers: {}\n", e);
 
-                    response.set_rcode(2);
+                    response.set_rcode(ResponseCodes::ServerFailure);
 
                     break;
                 }
@@ -93,38 +110,59 @@ impl DnsServer {
         return response;
     }
 
-    fn get_answers(&self, question: Question) -> Result<Vec<Answer>, String> {
-        if let Some(resolver_address) = &self.resolver_address {
-            let mut req = DnsPacket::new_query();
+    fn get_answers(
+        &self,
+        question: Question,
+        packet: &mut DnsPacket,
+    ) -> Result<Vec<Answer>, ServerError> {
+        if let Some(resolver_address) = &self.config.resolver {
+            let mut resolver_req = DnsPacket::new_query();
 
-            req.push_question(question);
+            resolver_req.push_question(question);
 
-            req.set_rd(1);
+            resolver_req.set_rd(1);
 
-            let resolver_socket =
-                UdpSocket::bind("0.0.0.0:0").expect("Failed to bind for resolver");
+            let resolver_socket = UdpSocket::bind("0.0.0.0:0")?;
 
             resolver_socket
-                .send_to(&req.get_bytes(), resolver_address)
+                .send_to(&resolver_req.encode(), resolver_address)
                 .expect("Failed to send to resolver");
 
             let mut res_buf = [0u8; 512];
 
-            match resolver_socket.recv_from(&mut res_buf) {
-                Ok((size, _)) => {
-                    println!("Received {} bytes from resolver", size);
-                    let response = DnsPacket::from_buf(&res_buf);
-                    response.print();
+            resolver_socket
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
 
-                    Ok(response.get_answers())
+            let (size, _) = resolver_socket.recv_from(&mut res_buf)?;
+
+            println!("Received {} bytes from resolver", size);
+            let response = DnsPacket::from_buf(&res_buf);
+            response.print_summary();
+
+            if response.get_rcode() != 0 {
+                if response.get_rcode() == 3 {
+                    let authorities = response.get_authorities();
+                    if authorities.len() == 0 {
+                        return Err(ServerError::Resolver(String::from(
+                            "No answer from resolver",
+                        )));
+                    }
+                    packet.push_authority(authorities[0].clone());
+                    return Ok(vec![]);
                 }
-                Err(e) => Err(format!("Failed to receive from resolver: {}", e)),
+                return Err(ServerError::Resolver(format!(
+                    "Resolver returned error code: {}",
+                    response.get_rcode()
+                )));
             }
+
+            Ok(response.get_answers())
         } else {
             Ok(vec![Answer {
                 question,
                 ttl: 2200,
-                data: Ipv4Addr::new(8, 8, 8, 8).to_bits(),
+                data: b"\x00\x00\x00\x00".to_vec(),
             }])
         }
     }
